@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "8, 9"
+os.environ["CUDA_VISIBLE_DEVICES"] = "8"
 
 from util import cal_loss, IOStream
 from src.qdataset import QuaternionFixedDataset, QuaternionTransform, rad_to_deg
@@ -69,8 +69,8 @@ def main(args, io):
     print("Let's use", torch.cuda.device_count(), "GPUs!")
     DGCNNModel = DGCNN_semseg(args)
 
-    assert 0, 'import torch==1.4 but I need to use torch==1.7 to load pretrained model'
-    DGCNNModel.load_state_dict(torch.load('semseg_6.t7'))
+    #assert 0, 'import torch==1.4 but I need to use torch==1.7 to load pretrained model'
+    #DGCNNModel.load_state_dict(torch.load('semseg_6.t7'))
 
     DGCNNModel.cuda()
     DGCNNModel = nn.DataParallel(DGCNNModel)
@@ -89,15 +89,16 @@ def main(args, io):
     opt = optim.SGD(SampleNetModel.parameters(), lr=args.lr,
                     momentum=args.momentum, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
+    criterion = cal_loss
 
     for i in range(args.epochs):
         print('Epoch [%d]' % (i + 1))
-        train(args, io, SampleNetModel, DGCNNModel, train_loader, opt)
+        train(args, io, SampleNetModel, DGCNNModel, train_loader, opt,criterion)
         scheduler.step()
         loss = test()
 
 
-def train(args, io, SampleNetModel, DGCNNModel, train_loader, opt):
+def train(args, io, SampleNetModel, DGCNNModel, train_loader, opt,criterion):
     train_loss = 0.0
     count = 0.0
     SampleNetModel.train()
@@ -111,17 +112,18 @@ def train(args, io, SampleNetModel, DGCNNModel, train_loader, opt):
     for data, seg in train_loader:
         print(ii, '/', len(train_loader), end='\r')
         ii += 1
-
+        print(seg.shape)
         data, seg = data.cuda(), seg.cuda()
         data = data[:, :, :3]
-        # data = data.permute(0, 2, 1)[:, :3]
+        
         data = SampleNetModel(data)
-        seg_pred = DGCNNModel(data)
 
+        data = data[1].permute(0, 2, 1)
         batch_size = data.size()[0]
         opt.zero_grad()
-
+        seg_pred = DGCNNModel(data)
         seg_pred = seg_pred.permute(0, 2, 1).contiguous()
+        print(seg_pred.size(0),seg_pred.size(1),seg_pred.size(2))
         loss = criterion(seg_pred.view(-1, 13), seg.view(-1, 1).squeeze())
         loss.backward()
         opt.step()

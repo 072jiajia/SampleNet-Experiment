@@ -5,7 +5,7 @@ import torch.nn as nn
 import numpy as np
 
 from knn_cuda import KNN
-from pointnet2.utils.pointnet2_utils import grouping_operation as group_point
+from src.pointnet2_ops_lib.pointnet2_ops.pointnet2_utils import grouping_operation as group_point
 
 
 def knn_point(group_size, point_cloud, query_cloud):
@@ -84,7 +84,7 @@ class SoftProjection(nn.Module):
             torch.int32
         )  # index should be Batch x QueryPoints x K
 
-        assert 0, 'group_point leads to error'
+        #assert 0, 'group_point leads to error'
         grouped_points = group_point(point_cloud, idx)  # B x 3 x QueryPoints x K
         grouped_features = (
             None if point_features is None else group_point(point_features, idx)
