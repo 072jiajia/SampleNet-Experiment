@@ -1,6 +1,4 @@
 import os
-import sys
-import glob
 import h5py
 import numpy as np
 import torch
@@ -19,7 +17,6 @@ def load_data_semseg(partition, test_area):
     with open(os.path.join(data_dir, "room_filelist.txt")) as f:
         room_filelist = [line.rstrip() for line in f]
     data_batchlist, label_batchlist = [], []
-    i = 0
     for f in all_files:
         file = h5py.File(os.path.join(DATA_DIR, f), 'r+')
         data = file["data"][:]
@@ -44,45 +41,30 @@ def load_data_semseg(partition, test_area):
     return all_data, all_seg
 
 
-def translate_pointcloud(pointcloud):
-    xyz1 = np.random.uniform(low=2./3., high=3./2., size=[3])
-    xyz2 = np.random.uniform(low=-0.2, high=0.2, size=[3])
-       
-    translated_pointcloud = np.add(np.multiply(pointcloud, xyz1), xyz2).astype('float32')
-    return translated_pointcloud
 
-
-def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
-    N, C = pointcloud.shape
-    pointcloud += np.clip(sigma * np.random.randn(N, C), -1*clip, clip)
-    return pointcloud
-
-
-def rotate_pointcloud(pointcloud):
-    theta = np.pi*2 * np.random.uniform()
-    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)],[np.sin(theta), np.cos(theta)]])
-    pointcloud[:,[0,2]] = pointcloud[:,[0,2]].dot(rotation_matrix) # random rotation (x,z)
-    return pointcloud
-
-
-class S3DIS(Dataset):
+class S3DIS_cls(Dataset):
     def __init__(self, num_points=4096, partition='train', test_area='1'):
-        print('loading')
+        print('loading', partition, 'data')
         self.data, self.seg = load_data_semseg(partition, test_area)
         self.num_points = num_points
-        self.partition = partition       
-        print(len(self.data)) 
+        self.partition = partition
 
     def __getitem__(self, item):
         pointcloud = self.data[item][:self.num_points]
         seg = self.seg[item][:self.num_points]
+
+        # Shuffle the training data
+        # But it seems like it doesn't work
         if self.partition == 'train':
-            indices = list(range(pointcloud.shape[0]))
+            indices = list(range(self.data[item].shape[0]))
             np.random.shuffle(indices)
-            pointcloud = pointcloud[indices]
-            seg = seg[indices]
-        seg = torch.LongTensor(seg)
-        return pointcloud, seg
+            self.data[item] = self.data[item][indices]
+            self.seg[item] = self.seg[item][indices]
+
+        labels = torch.zeros(13)
+        for idx in set(seg):
+            labels[idx] = 1.
+        return pointcloud, labels
 
     def __len__(self):
         return self.data.shape[0]
