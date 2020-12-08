@@ -3,7 +3,7 @@
 ## Download
 
 ```bash
-git clone https://github.com/KaivinC/SampleNet-Experiment
+git clone https://github.com/072jiajia/SampleNet-Experiment.git
 ```
 
 ## Docker Environment
