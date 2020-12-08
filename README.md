@@ -23,4 +23,16 @@ docker run --runtime nvidia -v $(pwd):/workspace/ -it --name {your docker's name
 pip install pointnet2_ops_lib/.
 ```
 
+# Pretrain
+```
+python3 pretrain.py
+```
+
+
+# Train SampleNet
+```
+python3 experiment.py
+```
+
+
 
