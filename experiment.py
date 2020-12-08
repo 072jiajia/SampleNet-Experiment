@@ -1,27 +1,21 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "8"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
-from util import cal_loss, IOStream
-from src.qdataset import QuaternionFixedDataset, QuaternionTransform, rad_to_deg
-from src.pctransforms import OnUnitCube, PointcloudToTensor
-from src import sputils
-from src import ChamferDistance, FPSSampler, RandomSampler, SampleNet
-from torch.utils.data import DataLoader
-from models import pcrnet
-from data import S3DIS
-from model import DGCNN_semseg
-import torch
-import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
-import torch.optim as optim
-import torch.nn as nn
 import argparse
-import logging
-import sys
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+
+# custom module
+from util import IOStream, AverageMeter, MultiClassBCE, calculate_ACC
+from src import SampleNet
+from data import S3DIS_cls
+from model import DGCNN
 
 
-
-# fmt: off
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -32,6 +26,8 @@ def get_args():
                         help='Dimension of embeddings in SampleNet')
     parser.add_argument('--group-size', type=int, default=8,
                         help='Dimension of embeddings in SampleNet')
+    parser.add_argument('--path', type=str, help="pretrained model's path",
+                        default='checkpoints/pretrained/model_6.t7')
 
     # DGCNN
     parser.add_argument('--test_area', type=str, default='6', metavar='N',
@@ -45,36 +41,24 @@ def get_args():
     parser.add_argument('--k', type=int, default=20, metavar='N',
                         help='Num of nearest neighbors to use')
 
-    parser.add_argument('--workers', default=40, type=int,
-                        metavar='N', help='number of data loading workers (default: 4)')
-    parser.add_argument('--batch-size', default=6, type=int,
+    parser.add_argument('--batch-size', default=50, type=int,
                         metavar='N', help='mini-batch size (default: 32)')
     parser.add_argument('--epochs', default=400, type=int,
                         metavar='N', help='number of total epochs to run')
-    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
+    parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                         help='learning rate (default: 0.001, 0.1 if using sgd)')
-    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
-                        help='SGD momentum (default: 0.9)')
 
     args = parser.parse_args()
+    if not os.path.exists('SampleNetCheckPoint/'):
+        os.mkdir('SampleNetCheckPoint')
     return args
 
 
 def main(args, io):
-    train_loader = DataLoader(S3DIS(partition='train', num_points=args.num_points, test_area=args.test_area),
-                              num_workers=4, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(S3DIS(partition='test', num_points=args.num_points, test_area=args.test_area),
-                             num_workers=4, batch_size=args.batch_size, shuffle=False, drop_last=False)
-
     print("Let's use", torch.cuda.device_count(), "GPUs!")
-    DGCNNModel = DGCNN_semseg(args)
-
-    #assert 0, 'import torch==1.4 but I need to use torch==1.7 to load pretrained model'
-    #DGCNNModel.load_state_dict(torch.load('semseg_6.t7'))
-
-    DGCNNModel.cuda()
+    DGCNNModel = DGCNN(args).cuda()
     DGCNNModel = nn.DataParallel(DGCNNModel)
-    DGCNNModel.eval()
+    DGCNNModel.load_state_dict(torch.load(args.path))
 
     SampleNetModel = SampleNet(
         num_out_points=args.sample_points,
@@ -83,89 +67,170 @@ def main(args, io):
         initial_temperature=1.0,
         input_shape="bnc",
         output_shape="bnc",
+        complete_fps=False
     )
     SampleNetModel.cuda()
     SampleNetModel = nn.DataParallel(SampleNetModel)
+
+    train_loader = DataLoader(S3DIS_cls(partition='train', num_points=args.num_points, test_area=args.test_area),
+                              num_workers=0, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    test_loader = DataLoader(S3DIS_cls(partition='test', num_points=args.num_points, test_area=args.test_area),
+                             num_workers=0, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
     opt = optim.SGD(SampleNetModel.parameters(), lr=args.lr,
-                    momentum=args.momentum, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=1e-3)
-    criterion = cal_loss
+                    momentum=0.9, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(opt, args.epochs)
 
+    best_test_loss = 1e10
     for i in range(args.epochs):
-        print('Epoch [%d]' % (i + 1))
-        train(args, io, SampleNetModel, DGCNNModel, train_loader, opt,criterion)
+        io.cprint('Epoch [%d]' % (i + 1))
+        train(SampleNetModel, DGCNNModel, train_loader, opt, io)
         scheduler.step()
-        loss = test()
+        test_loss = test(SampleNetModel, DGCNNModel, test_loader, io)
+
+        torch.save(SampleNetModel, 'SampleNetCheckPoint/checkpoint.t7')
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            torch.save(SampleNetModel, 'SampleNetCheckPoint/bestsamplenet.t7')
 
 
-def train(args, io, SampleNetModel, DGCNNModel, train_loader, opt,criterion):
-    train_loss = 0.0
-    count = 0.0
+def train(SampleNetModel, DGCNNModel, train_loader, opt, io):
+    TASKLOSS = AverageMeter()
+    SIMPLIFICATIONLOSS = AverageMeter()
+    PROJECTIONLOSS = AverageMeter()
+    TOTALLOSS = AverageMeter()
+    ACC50 = AverageMeter()
+
     SampleNetModel.train()
     DGCNNModel.eval()
-    train_true_cls = []
-    train_pred_cls = []
-    train_true_seg = []
-    train_pred_seg = []
-    train_label_seg = []
-    ii = 0
-    for data, seg in train_loader:
-        print(ii, '/', len(train_loader), end='\r')
-        ii += 1
-        print(seg.shape)
-        data, seg = data.cuda(), seg.cuda()
-        data = data[:, :, :3]
-        
-        data = SampleNetModel(data)
+    for i, (data, labels) in enumerate(train_loader):
+        data, labels = data.cuda(), labels.cuda()
 
-        data = data[1].permute(0, 2, 1)
-        batch_size = data.size()[0]
+        #####################
+        ###### Sampling #####
+        #####################
+        notprojectedpoints, SamplePoints = SampleNetModel(data)
+
+        ############################
+        ###### Downstream Task #####
+        ############################
+        SamplePoints = SamplePoints.permute((0, 2, 1))
+        pred = DGCNNModel(SamplePoints)
+
+        #########################
+        ###### Compute Loss #####
+        #########################
+        ALPHA = 0.01
+        LMBDA = 1e-4
+        # task loss
+        task_loss = MultiClassBCE(pred, labels)
+        # simplified loss
+        simplification_loss = SampleNetModel.module.get_simplification_loss(
+            data, SamplePoints, SamplePoints.shape[0], 1, 0
+        ) * ALPHA
+        # t ** 2
+        projection_loss = SampleNetModel.module.get_projection_loss() * LMBDA
+
+        # total loss
+        loss = task_loss + simplification_loss + projection_loss
+
+        # Calculate Accuracy
+        acc = calculate_ACC(pred, labels)
+
+        ##########################
+        ###### Record Losses #####
+        ##########################
+        batch_size = SamplePoints.shape[0]
+        TASKLOSS.update(float(task_loss), batch_size)
+        SIMPLIFICATIONLOSS.update(float(simplification_loss), batch_size)
+        PROJECTIONLOSS.update(float(projection_loss), batch_size)
+        TOTALLOSS.update(float(loss), batch_size)
+        ACC50.update(acc, batch_size)
+
+        #############################
+        ###### Back Propagation #####
+        #############################
         opt.zero_grad()
-        seg_pred = DGCNNModel(data)
-        seg_pred = seg_pred.permute(0, 2, 1).contiguous()
-        print(seg_pred.size(0),seg_pred.size(1),seg_pred.size(2))
-        loss = criterion(seg_pred.view(-1, 13), seg.view(-1, 1).squeeze())
         loss.backward()
         opt.step()
-        pred = seg_pred.max(dim=2)[1]               # (batch_size, num_points)
-        count += batch_size
-        train_loss += loss.item() * batch_size
-        seg_np = seg.cpu().numpy()                  # (batch_size, num_points)
-        pred_np = pred.detach().cpu().numpy()       # (batch_size, num_points)
-        # (batch_size * num_points)
-        train_true_cls.append(seg_np.reshape(-1))
-        # (batch_size * num_points)
-        train_pred_cls.append(pred_np.reshape(-1))
-        train_true_seg.append(seg_np)
-        train_pred_seg.append(pred_np)
 
-    train_true_cls = np.concatenate(train_true_cls)
-    train_pred_cls = np.concatenate(train_pred_cls)
-    train_acc = metrics.accuracy_score(train_true_cls, train_pred_cls)
-    avg_per_class_acc = metrics.balanced_accuracy_score(
-        train_true_cls, train_pred_cls)
-    train_true_seg = np.concatenate(train_true_seg, axis=0)
-    train_pred_seg = np.concatenate(train_pred_seg, axis=0)
-    train_ious = calculate_sem_IoU(train_pred_seg, train_true_seg)
-    print(' * Train * loss: %.6f  '
-          'train acc: %.6f  '
-          'train avg acc: %.6f  '
-          'train iou: %.6f     '
-          % (epoch,
-             train_loss*1.0/count,
-             train_acc,
-             avg_per_class_acc,
-             np.mean(train_ious)))
+        #########################
+        ###### Print Losses #####
+        #########################
+        print(' * [{0}/{1}] * '
+              'Acc@0.5: {ACC50.val:.4f} ({ACC50.avg:.4f})  '
+              'loss {total.val:.4f} ({total.avg:.4f})  '
+              'task loss {task.val:.4f} ({task.avg:.4f})  '
+              'project loss {project.val:f} ({project.avg:f})  '
+              'simplified loss {simplified.val:.4f} ({simplified.avg:.4f})'
+              .format(i, len(train_loader),
+                      ACC50=ACC50,
+                      total=TOTALLOSS,
+                      task=TASKLOSS,
+                      project=PROJECTIONLOSS,
+                      simplified=SIMPLIFICATIONLOSS),
+              end='             \r')
+
+    print(' ' * 180, end='\r')
+    io.cprint(' * Train * Loss: %.6f  ACC@0.5: %.6f' % (TOTALLOSS.avg, ACC50.avg))
 
     return
 
-# def test(args, io, SampleNetModel, DGCNNModel, train_loader, opt):
-#     pass
+
+def test(SampleNetModel, DGCNNModel, test_loader, io):
+    TOTALLOSS = AverageMeter()
+    ACC50 = AverageMeter()
+
+    SampleNetModel.eval()
+    DGCNNModel.eval()
+    with torch.no_grad():
+        for i, (data, labels) in enumerate(test_loader):
+            data, labels = data.cuda(), labels.cuda()
+
+            #####################
+            ###### Sampling #####
+            #####################
+            notprojectedpoints, SamplePoints = SampleNetModel(data)
+
+            ############################
+            ###### Downstream Task #####
+            ############################
+            SamplePoints = SamplePoints.permute((0, 2, 1))
+            pred = DGCNNModel(SamplePoints)
+
+            #########################
+            ###### Compute Loss #####
+            #########################
+            loss = MultiClassBCE(pred, labels)
+
+            # Calculate Accuracy
+            acc = calculate_ACC(pred, labels)
+
+            ##########################
+            ###### Record Losses #####
+            ##########################
+            batch_size = SamplePoints.shape[0]
+            TOTALLOSS.update(float(loss), batch_size)
+            ACC50.update(acc, batch_size)
+
+            #########################
+            ###### Print Losses #####
+            #########################
+            print(' * [{0}/{1}] * '
+                  'Acc@0.5: {ACC50.val:.4f} ({ACC50.avg:.4f})'
+                  'loss {total.val:.4f} ({total.avg:.4f})'
+                  .format(i, len(test_loader),
+                          ACC50=ACC50,
+                          total=TOTALLOSS),
+                  end='             \r')
+        print(' ' * 180, end='\r')
+        io.cprint(' * Test * Loss: %.6f  ACC@0.5: %.6f' % (TOTALLOSS.avg, ACC50.avg))
+        return TOTALLOSS.avg
 
 
 if __name__ == "__main__":
     torch.manual_seed(1)
     torch.cuda.manual_seed(1)
     args = get_args()
-    io = IOStream('run.log')
+    io = IOStream('SampleNetCheckPoint/run.log')
     main(args, io)
