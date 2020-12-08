@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 def knn(x, k):
-    
+    # Obtain KNNs' Indices
     inner = -2*torch.matmul(x.transpose(2, 1), x)
     xx = torch.sum(x**2, dim=1, keepdim=True)
     pairwise_distance = -xx - inner - xx.transpose(2, 1)
@@ -31,11 +31,8 @@ def get_graph_feature(x, k=20, idx=None, dim9=False):
             idx = knn(x[:, 6:], k=k)
     device = torch.device('cuda')
 
-    idx_base = torch.arange(
-        0, batch_size, device=device).view(-1, 1, 1)*num_points
-    
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
     idx = idx + idx_base
-    
     idx = idx.view(-1)
     
     _, num_dims, _ = x.size()
@@ -51,9 +48,9 @@ def get_graph_feature(x, k=20, idx=None, dim9=False):
     return feature      # (batch_size, 2*num_dims, num_points, k)
 
 
-class DGCNN_semseg(nn.Module):
+class DGCNN(nn.Module):
     def __init__(self, args):
-        super(DGCNN_semseg, self).__init__()
+        super(DGCNN, self).__init__()
         self.args = args
         self.k = args.k
 
@@ -66,7 +63,7 @@ class DGCNN_semseg(nn.Module):
         self.bn7 = nn.BatchNorm1d(512)
         self.bn8 = nn.BatchNorm1d(256)
 
-        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+        self.conv1 = nn.Sequential(nn.Conv2d(18, 64, kernel_size=1, bias=False),
                                    self.bn1,
                                    nn.LeakyReLU(negative_slope=0.2))
         self.conv2 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=1, bias=False),
@@ -90,8 +87,8 @@ class DGCNN_semseg(nn.Module):
         self.conv8 = nn.Sequential(nn.Conv1d(512, 256, kernel_size=1, bias=False),
                                    self.bn8,
                                    nn.LeakyReLU(negative_slope=0.2))
-        self.dp1 = nn.Dropout(p=args.dropout)
-        self.conv9 = nn.Conv1d(256, 13, kernel_size=1, bias=False)
+
+        self.FullyConnected = nn.Linear(256, 13, bias=False)
 
     def forward(self, x):
         batch_size = x.size(0)
@@ -140,8 +137,10 @@ class DGCNN_semseg(nn.Module):
         x = self.conv7(x)
         # (batch_size, 512, num_points) -> (batch_size, 256, num_points)
         x = self.conv8(x)
-        x = self.dp1(x)
-        # (batch_size, 256, num_points) -> (batch_size, 13, num_points)
-        x = self.conv9(x)
 
+        # (batch_size, 256, num_points) -> (batch_size, 256)
+        x = nn.AdaptiveAvgPool1d(1)(x)
+        x = nn.Flatten()(x)
+        # (batch_size, 256) -> (batch_size, 13)
+        x = self.FullyConnected(x)
         return x
