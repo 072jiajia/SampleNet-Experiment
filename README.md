@@ -20,7 +20,7 @@ docker run --runtime nvidia -v $(pwd):/workspace/ -it --name {your docker's name
 ## Building only the CUDA kernels
 
 ```bash
-pip install pointnet2_ops_lib/.
+pip install src/pointnet2_ops_lib/.
 ```
 
 # Pretrain
