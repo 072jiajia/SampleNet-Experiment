@@ -6,7 +6,7 @@
 git clone https://github.com/072jiajia/SampleNet-Experiment.git
 ```
 And put the dataset to the path below
-<div align="center">
+<div align="left">
   <img src="https://github.com/072jiajia/SampleNet-Experiment/blob/main/DataPath.png"/>
 </div>
 
